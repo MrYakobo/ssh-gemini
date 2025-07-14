@@ -4,164 +4,190 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strings"
 
-	"golang.org/x/crypto/ssh"
+	tea "github.com/charmbracelet/bubbletea"
+	cssh "github.com/charmbracelet/ssh"
+	"github.com/charmbracelet/wish"
+	bbtea "github.com/charmbracelet/wish/bubbletea"
+	"github.com/charmbracelet/wish/logging"
 )
 
-const (
-	apiURL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
-)
+const apiURL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
 
 var apiKey = os.Getenv("GEMINI_API_KEY")
 
-type Part struct {
-	Text string `json:"text"`
+type model struct {
+	prompt  string
+	output  string
+	loading bool
+	err     error
 }
 
-type Content struct {
-	Role  string `json:"role"`
-	Parts []Part `json:"parts"`
+func initialModel() model {
+	return model{}
 }
 
-type GeminiRequest struct {
-	Contents []Content `json:"contents"`
+func (m model) Init() tea.Cmd {
+	return tea.EnterAltScreen
 }
 
-type GeminiResponse struct {
-	Candidates []struct {
-		Content struct {
-			Parts []struct {
-				Text string `json:"text"`
-			} `json:"parts"`
-		} `json:"content"`
-	} `json:"candidates"`
-}
-
-func handleSession(s ssh.Session) {
-	fmt.Fprintln(s, "Connected to Gemini Flash via SSH.")
-	fmt.Fprint(s, "> ")
-
-	buf := make([]byte, 4096)
-	n, err := s.Read(buf)
-	if err != nil {
-		fmt.Fprintln(s, "Failed to read input")
-		s.Exit(1)
-		return
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.Type {
+		case tea.KeyCtrlC, tea.KeyEsc:
+			return m, tea.Quit
+		case tea.KeyEnter:
+			if strings.TrimSpace(m.prompt) == "" {
+				return m, nil
+			}
+			m.loading = true
+			return m, sendToGemini(m.prompt)
+		case tea.KeyBackspace:
+			if !m.loading && len(m.prompt) > 0 {
+				m.prompt = m.prompt[:len(m.prompt)-1]
+			}
+		default:
+			if !m.loading {
+				m.prompt += msg.String()
+			}
+		}
+	case geminiResponse:
+		m.loading = false
+		m.output = msg.Text
+		m.prompt = "" // Clear prompt after response
+	case geminiError:
+		m.loading = false
+		m.err = msg.Err
 	}
-	prompt := strings.TrimSpace(string(buf[:n]))
-
-	resp, err := queryGemini(prompt)
-	if err != nil {
-		fmt.Fprintf(s, "Error: %v\n", err)
-		s.Exit(1)
-		return
-	}
-
-	fmt.Fprintln(s, "\n--- Gemini Response ---")
-	fmt.Fprintln(s, resp)
-	s.Exit(0)
+	return m, nil
 }
 
+func (m model) View() string {
+	if m.err != nil {
+		return fmt.Sprintf("Error: %v\n\nPress Ctrl+C to quit.", m.err)
+	}
+
+	view := "# Gemini 1.5 Flash over SSH\n\n"
+
+	if m.loading {
+		view += fmt.Sprintf("Prompt: %s\n\n   Thinking...\n\n", m.prompt)
+		view += fmt.Sprintf("Prompt: %s\n\nThinking...\n", m.prompt)
+	} else {
+		if m.output != "" {
+			view += fmt.Sprintf("Response:\n%s\n\n", m.output)
+		}
+		view += fmt.Sprintf("> %s\n", m.prompt)
+		view += "\nType your prompt and press Enter. Ctrl+C to exit.\n"
+	}
+
+	return view
+}
+
+// Msg types
+type geminiResponse struct{ Text string }
+type geminiError struct{ Err error }
+
+func sendToGemini(prompt string) tea.Cmd {
+	return func() tea.Msg {
+		text, err := queryGemini(prompt)
+		if err != nil {
+			return geminiError{Err: err}
+		}
+		return geminiResponse{Text: text}
+	}
+}
+
+// Gemini API request
 func queryGemini(prompt string) (string, error) {
-	request := GeminiRequest{
-		Contents: []Content{
+	if apiKey == "" {
+		return "", fmt.Errorf("missing GEMINI_API_KEY env var")
+	}
+
+	body := map[string]interface{}{
+		"contents": []map[string]interface{}{
 			{
-				Role: "user",
-				Parts: []Part{
-					{Text: prompt},
+				"role": "user",
+				"parts": []map[string]string{
+					{"text": prompt},
 				},
 			},
 		},
 	}
-	body, err := json.Marshal(request)
-	if err != nil {
-		return "", err
-	}
 
-	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(body))
-	if err != nil {
-		return "", err
-	}
+	data, _ := json.Marshal(body)
+	req, _ := http.NewRequest("POST", apiURL, bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-goog-api-key", apiKey)
 
-	client := &http.Client{}
-	res, err := client.Do(req)
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer res.Body.Close()
 
-	if res.StatusCode != 200 {
-		respBody, _ := io.ReadAll(res.Body)
-		return "", fmt.Errorf("HTTP %d: %s", res.StatusCode, string(respBody))
+	var parsed struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
 	}
 
-	var gemResp GeminiResponse
-	err = json.NewDecoder(res.Body).Decode(&gemResp)
-	if err != nil {
+	if err := json.NewDecoder(res.Body).Decode(&parsed); err != nil {
 		return "", err
 	}
-	if len(gemResp.Candidates) == 0 {
+
+	if len(parsed.Candidates) == 0 || len(parsed.Candidates[0].Content.Parts) == 0 {
 		return "(no response)", nil
 	}
-	return gemResp.Candidates[0].Content.Parts[0].Text, nil
+
+	return parsed.Candidates[0].Content.Parts[0].Text, nil
 }
 
 func main() {
 	if apiKey == "" {
-		log.Fatal("Set GEMINI_API_KEY in env")
+		log.Fatal("Please set GEMINI_API_KEY")
 	}
 
-	privateBytes, err := os.ReadFile("id_rsa") // generate if missing
-	if err != nil {
-		log.Fatal("Missing SSH key. Run: ssh-keygen -t rsa -f id_rsa")
-	}
-	private, err := ssh.ParsePrivateKey(privateBytes)
-	if err != nil {
-		log.Fatal("Failed to parse SSH key:", err)
-	}
-
-	config := &ssh.ServerConfig{
-		NoClientAuth: true,
-	}
-	config.AddHostKey(private)
-
-	listener, err := net.Listen("tcp", ":2222")
-	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
-	}
-	log.Println("SSH Gemini gateway running on port 2222")
-
-	for {
-		conn, err := listener.Accept()
+	if os.Getenv("TEST") != "" {
+		println("yo moma")
+		// test gemini connection
+		res, err := queryGemini("hello who are you?")
 		if err != nil {
-			log.Printf("Accept error: %v", err)
-			continue
+			log.Fatalln(err)
 		}
-		go func() {
-			sshConn, chans, _, err := ssh.NewServerConn(conn, config)
-			if err != nil {
-				log.Printf("SSH handshake failed: %v", err)
-				return
-			}
-			defer sshConn.Close()
+		fmt.Println("Result:\n" + res)
+		return
+	}
 
-			for newChannel := range chans {
-				if newChannel.ChannelType() != "session" {
-					newChannel.Reject(ssh.UnknownChannelType, "Only session supported")
-					continue
-				}
-				channel, requests, _ := newChannel.Accept()
-				go ssh.DiscardRequests(requests)
-				handleSession(channel)
-			}
-		}()
+	// Handler that returns just the model - options are handled by the middleware
+	// type Handler func(sess ssh.Session) (tea.Model, []tea.ProgramOption)
+
+	var handler bbtea.Handler = func(session cssh.Session) (tea.Model, []tea.ProgramOption) {
+		return initialModel(), nil
+	}
+
+	s, err := wish.NewServer(
+		wish.WithAddress(":2222"),
+		wish.WithHostKeyPath("id_ed25519"), // run ssh-keygen -t ed25519 -f id_ed25519 if missing
+		wish.WithMiddleware(
+			logging.Middleware(),
+			bbtea.Middleware(handler),
+		),
+	)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	log.Println("SSH Gemini is running on port 2222")
+	if err := s.ListenAndServe(); err != nil {
+		log.Fatalln(err)
 	}
 }
