@@ -76,7 +76,6 @@ func (m model) View() string {
 
 	if m.loading {
 		view += fmt.Sprintf("Prompt: %s\n\n   Thinking...\n\n", m.prompt)
-		view += fmt.Sprintf("Prompt: %s\n\nThinking...\n", m.prompt)
 	} else {
 		if m.output != "" {
 			view += fmt.Sprintf("Response:\n%s\n\n", m.output)
